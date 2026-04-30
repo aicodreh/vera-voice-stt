@@ -114,8 +114,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 "error": "Failed to connect to Deepgram"
             })
             await websocket.close()
-                      return
-await websocket.send_json({
+            return
+        
+        await websocket.send_json({
             "type": "status",
             "message": "Connected to Deepgram, ready for audio"
         })
@@ -162,4 +163,3 @@ await websocket.send_json({
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
