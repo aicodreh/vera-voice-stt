@@ -1,15 +1,14 @@
 """
-Vera Voice STT Module
+Vera Voice STT Module (Async Version)
 Standalone Deepgram speech-to-text service
 Ready to integrate with OpenClaw for Option A
 """
 
 import os
-import json
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
+from deepgram import DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 
@@ -37,30 +36,39 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         return
     
+    transcript_parts = []
+    dg_connection = None
+    
     try:
-        deepgram = DeepgramClient(DEEPGRAM_API_KEY)
-        dg_connection = deepgram.listen.live.v("1")
-        transcript_parts = []
+        config = DeepgramClientOptions(options={"keepalive": "true"})
+        deepgram = DeepgramClient(DEEPGRAM_API_KEY, config)
+        dg_connection = deepgram.listen.asynclive.v("1")
         
-        def on_message(self, result, **kwargs):
-            transcript = result.channel.alternatives[0].transcript
-            if transcript:
-                is_final = result.is_final
-                print(f"Transcript ({'final' if is_final else 'interim'}): {transcript}")
-                asyncio.run(websocket.send_json({
-                    "type": "transcript",
-                    "text": transcript,
-                    "is_final": is_final,
-                    "confidence": result.channel.alternatives[0].confidence
-                }))
-                if is_final:
-                    transcript_parts.append(transcript)
+        async def on_message(self, result, **kwargs):
+            try:
+                transcript = result.channel.alternatives[0].transcript
+                if transcript:
+                    is_final = result.is_final
+                    print(f"Transcript ({'final' if is_final else 'interim'}): {transcript}")
+                    await websocket.send_json({
+                        "type": "transcript",
+                        "text": transcript,
+                        "is_final": is_final,
+                        "confidence": result.channel.alternatives[0].confidence
+                    })
+                    if is_final:
+                        transcript_parts.append(transcript)
+            except Exception as e:
+                print(f"Error in on_message: {e}")
         
-        def on_error(self, error, **kwargs):
+        async def on_error(self, error, **kwargs):
             print(f"Deepgram error: {error}")
-            asyncio.run(websocket.send_json({"type": "error", "message": str(error)}))
+            try:
+                await websocket.send_json({"type": "error", "message": str(error)})
+            except:
+                pass
         
-        def on_close(self, close, **kwargs):
+        async def on_close(self, close, **kwargs):
             print("Deepgram connection closed")
         
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
@@ -78,28 +86,23 @@ async def websocket_endpoint(websocket: WebSocket):
             channels=1
         )
         
-        if not dg_connection.start(options):
+        if await dg_connection.start(options) is False:
             await websocket.send_json({"error": "Failed to connect to Deepgram"})
             await websocket.close()
             return
         
         await websocket.send_json({"type": "status", "message": "Connected to Deepgram, ready for audio"})
         
-        try:
-            while True:
+        while True:
+            try:
                 data = await websocket.receive_bytes()
-                dg_connection.send(data)
-        except WebSocketDisconnect:
-            print("Client disconnected")
-        finally:
-            dg_connection.finish()
-            if transcript_parts:
-                full_transcript = " ".join(transcript_parts)
-                try:
-                    await websocket.send_json({"type": "final_transcript", "text": full_transcript})
-                except:
-                    pass
-            print("Deepgram connection finished")
+                await dg_connection.send(data)
+            except WebSocketDisconnect:
+                print("Client disconnected")
+                break
+            except Exception as e:
+                print(f"Error receiving audio: {e}")
+                break
     
     except Exception as e:
         print(f"Error: {e}")
@@ -107,6 +110,22 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_json({"type": "error", "message": str(e)})
         except:
             pass
+    
+    finally:
+        if dg_connection:
+            try:
+                await dg_connection.finish()
+            except:
+                pass
+        
+        if transcript_parts:
+            full_transcript = " ".join(transcript_parts)
+            try:
+                await websocket.send_json({"type": "final_transcript", "text": full_transcript})
+            except:
+                pass
+        
+        print("Connection finished")
 
 
 if __name__ == "__main__":
