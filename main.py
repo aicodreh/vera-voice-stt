@@ -73,7 +73,6 @@ async def websocket_endpoint(websocket: WebSocket):
             smart_format=True,
             interim_results=True,
             utterance_end_ms=1000,
-            vad_events=True,
             encoding="linear16",
             sample_rate=16000,
             channels=1
