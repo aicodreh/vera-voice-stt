@@ -1,86 +1,165 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vera Voice STT Test</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+"""
+Vera Voice STT Module
+Standalone Deepgram speech-to-text service
+Ready to integrate with OpenClaw for Option A
+"""
+
+import os
+import json
+import asyncio
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
+
+# Configuration
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
+
+app = FastAPI(title="Vera Voice STT")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def get_index():
+    """Serve the test interface"""
+    with open("index.html", "r") as f:
+        return f.read()
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {"status": "ok", "service": "vera-voice-stt"}
+
+
+@app.websocket("/listen")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time audio transcription
+    
+    Frontend sends: binary audio chunks (16kHz, 16-bit PCM)
+    Backend sends: JSON with transcription results
+    """
+    await websocket.accept()
+    print("Client connected")
+    
+    if not DEEPGRAM_API_KEY:
+        await websocket.send_json({
+            "error": "DEEPGRAM_API_KEY not configured"
+        })
+        await websocket.close()
+        return
+    
+    try:
+        # Initialize Deepgram client
+        deepgram = DeepgramClient(DEEPGRAM_API_KEY)
         
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0a0a0a;
-            color: #fff;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
+        # Create a live transcription connection
+        dg_connection = deepgram.listen.live.v("1")
         
-        .container {
-            max-width: 600px;
-            width: 100%;
-            text-align: center;
-        }
+        # Track transcription results
+        transcript_parts = []
         
-        h1 {
-            font-size: 2rem;
-            margin-bottom: 0.5rem;
-            color: #5BA4B5;
-        }
+        # Event handlers
+        def on_message(self, result, **kwargs):
+            """Handle transcription results"""
+            transcript = result.channel.alternatives[0].transcript
+            if transcript:
+                is_final = result.is_final
+                print(f"Transcript ({'final' if is_final else 'interim'}): {transcript}")
+                
+                # Send to client
+                asyncio.run(websocket.send_json({
+                    "type": "transcript",
+                    "text": transcript,
+                    "is_final": is_final,
+                    "confidence": result.channel.alternatives[0].confidence
+                }))
+                
+                if is_final:
+                    transcript_parts.append(transcript)
         
-        .subtitle {
-            color: #666;
-            margin-bottom: 2rem;
-        }
+        def on_error(self, error, **kwargs):
+            """Handle errors"""
+            print(f"Deepgram error: {error}")
+            asyncio.run(websocket.send_json({
+                "type": "error",
+                "message": str(error)
+            }))
         
-        .status {
-            padding: 10px 20px;
-            border-radius: 20px;
-            background: #1a1a1a;
-            display: inline-block;
-            margin-bottom: 2rem;
-            font-size: 0.9rem;
-        }
+        def on_close(self, close, **kwargs):
+            """Handle connection close"""
+            print("Deepgram connection closed")
         
-        .status.connected {
-            color: #4ade80;
-        }
+        # Register event handlers
+        dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+        dg_connection.on(LiveTranscriptionEvents.Error, on_error)
+        dg_connection.on(LiveTranscriptionEvents.Close, on_close)
         
-        .status.disconnected {
-            color: #f87171;
-        }
+        # Configure live transcription options
+        options = LiveOptions(
+            model="nova-2",           # Best accuracy model
+            language="en-US",
+            smart_format=True,        # Auto punctuation & formatting
+            interim_results=True,     # Get results as user speaks
+            utterance_end_ms=1000,    # Detect end of speech
+            vad_events=True,          # Voice activity detection
+            encoding="linear16",      # 16-bit PCM
+            sample_rate=16000,        # 16kHz
+            channels=1                # Mono
+        )
         
-        .status.listening {
-            color: #facc15;
-            animation: pulse 1.5s infinite;
-        }
+        # Start the connection
+        if not dg_connection.start(options):
+            await websocket.send_json({
+                "error": "Failed to connect to Deepgram"
+            })
+            await websocket.close()
+            return
         
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
+        await websocket.send_json({
+            "type": "status",
+            "message": "Connected to Deepgram, ready for audio"
+        })
         
-        .mic-button {
-            width: 100px;
-            height: 100px;
-            border-radius: 50%;
-            border: none;
-            background: linear-gradient(135deg, #5BA4B5, #4a8a99);
-            cursor: pointer;
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0 auto 2rem;
-        }
-        
-        .mic-button:hover {
-            transform: scale(1.05);
-            box-shadow: 0 0 30
+        # Receive audio chunks from client
+        try:
+            while True:
+                # Receive binary audio data
+                data = await websocket.receive_bytes()
+                
+                # Send to Deepgram
+                dg_connection.send(data)
+                
+        except WebSocketDisconnect:
+            print("Client disconnected")
+        finally:
+            # Close Deepgram connection
+            dg_connection.finish()
+            
+            # Send final transcript
+            if transcript_parts:
+                full_transcript = " ".join(transcript_parts)
+                try:
+                    await websocket.send_json({
+                        "type": "final_transcript",
+                        "text": full_transcript
+                    })
+                except:
+                    pass
+            
+            print("Deepgram connection finished")
+    
+    except Exception as e:
+        print(f"Error: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e)
+            })
+        except:
+            pass
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
